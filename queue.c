@@ -52,6 +52,9 @@ int output_queue_init(output_queue_t *queue, double rate)
 {
     memset(queue, 0, sizeof(*queue));
 
+    if (clock_gettime(CLOCK_MONOTONIC, &queue->last_refill) < 0)
+        return -1;
+
     if (pthread_mutex_init(&queue->lock, NULL) != 0)
         return -1;
 
@@ -67,8 +70,6 @@ int output_queue_init(output_queue_t *queue, double rate)
     queue->token_capacity = rate;
 
     queue->tokens = rate;
-
-    clock_gettime(CLOCK_MONOTONIC, &queue->last_refill);
 
     return 0;
 }
@@ -86,7 +87,12 @@ int output_queue_push(output_queue_t *queue, shared_frame_t *frame)
 
     node->next = NULL;
 
-    clock_gettime(CLOCK_MONOTONIC, &node->queued_at);
+    if (clock_gettime(CLOCK_MONOTONIC, &node->queued_at) < 0)
+    {
+        free(node);
+
+        return -1;
+    }
 
     pthread_mutex_lock(&queue->lock);
 
@@ -124,7 +130,8 @@ static int aged_priority(output_queue_t *queue)
 {
     struct timespec now;
 
-    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+        return -1;
 
     int selected = -1;
 
@@ -188,17 +195,7 @@ shared_frame_t *output_queue_pop(output_queue_t *queue)
         pthread_cond_wait(&queue->changed, &queue->lock);
     }
 
-    if (queue->count == 0 && queue->closed)
-    {
-        pthread_mutex_unlock(&queue->lock);
-
-        return NULL;
-    }
-
-    if (queue->tokens < 1.0 && queue->closed)
-        queue->tokens = 1.0;
-
-    if (queue->tokens < 1.0)
+    if (queue->closed)
     {
         pthread_mutex_unlock(&queue->lock);
 
@@ -238,7 +235,8 @@ void output_queue_refill(output_queue_t *queue)
 {
     struct timespec now;
 
-    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+        return;
 
     pthread_mutex_lock(&queue->lock);
 
@@ -264,8 +262,6 @@ void output_queue_close(output_queue_t *queue)
     pthread_mutex_lock(&queue->lock);
 
     queue->closed = 1;
-
-    queue->tokens = queue->token_capacity;
 
     pthread_cond_broadcast(&queue->changed);
 

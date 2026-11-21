@@ -12,7 +12,9 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
-static volatile sig_atomic_t stop_requested = 0;
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "SIGINT requires a lock-free flag");
+
+static atomic_int stop_requested = 0;
 
 static void handle_sigint(int signo)
 {
@@ -30,6 +32,12 @@ static int is_broadcast(const uint8_t mac[6])
     return memcmp(mac, broadcast, 6) == 0;
 }
 
+static void shutdown_socket(int fd)
+{
+    if (shutdown(fd, SHUT_RDWR) < 0 && errno != ENOTCONN)
+        perror("shutdown");
+}
+
 static void enqueue_to_port(
     switch_port_t *port,
     shared_frame_t *frame
@@ -41,11 +49,11 @@ static void enqueue_to_port(
     {
         shared_frame_release(frame);
 
-        port->frames_dropped++;
+        atomic_fetch_add(&port->frames_dropped, 1);
     }
 }
 
-static void forward_frame(
+static int forward_frame(
     switch_port_t *source,
     const frame_t *frame
 )
@@ -66,20 +74,18 @@ static void forward_frame(
                 "Port %d exceeded MAC limit; shutting it down\n",
                 source->id);
 
-        shutdown(source->fd, SHUT_RDWR);
-
-        return;
+        return -1;
     }
 
     if (learned < 0)
-        return;
+        return 0;
 
     shared_frame_t *shared = shared_frame_create(frame);
 
     if (shared == NULL)
-        return;
+        return 0;
 
-    pthread_mutex_lock(&sw->ports_lock);
+    pthread_rwlock_rdlock(&sw->ports_lock);
 
     if (!is_broadcast(frame->dst) &&
         mac_table_lookup(
@@ -98,20 +104,6 @@ static void forward_frame(
                 shared
             );
         }
-        else
-        {
-            for (int i = 0; i < sw->max_ports; i++)
-            {
-                if (i != source->id &&
-                    sw->ports[i].active)
-                {
-                    enqueue_to_port(
-                        &sw->ports[i],
-                        shared
-                    );
-                }
-            }
-        }
     }
     else
     {
@@ -128,18 +120,22 @@ static void forward_frame(
         }
     }
 
-    pthread_mutex_unlock(&sw->ports_lock);
+    pthread_rwlock_unlock(&sw->ports_lock);
 
     shared_frame_release(shared);
+
+    return 0;
 }
 
 static void *receiver_main(void *argument)
 {
     switch_port_t *port = argument;
 
+    switch_state_t *sw = port->sw;
+
     frame_t frame;
 
-    while (!atomic_load(&port->sw->stopping))
+    while (!atomic_load(&sw->stopping))
     {
         int result = frame_read(port->fd, &frame);
 
@@ -148,12 +144,32 @@ static void *receiver_main(void *argument)
 
         port->frames_in++;
 
-        forward_frame(port, &frame);
+        if (forward_frame(port, &frame) < 0)
+            break;
     }
+
+    shutdown_socket(port->fd);
 
     output_queue_close(&port->output);
 
-    atomic_store(&port->receiver_done, 1);
+    pthread_join(port->sender_thread, NULL);
+
+    pthread_rwlock_wrlock(&sw->ports_lock);
+
+    mac_table_remove_port(&sw->mac_table, port->id);
+
+    close(port->fd);
+
+    output_queue_destroy(&port->output);
+
+    port->active = 0;
+
+    printf("Port %d disconnected and released\n", port->id);
+
+    if (sem_post(&sw->free_ports) < 0)
+        perror("sem_post");
+
+    pthread_rwlock_unlock(&sw->ports_lock);
 
     return NULL;
 }
@@ -177,7 +193,7 @@ static void *sender_main(void *argument)
         {
             shared_frame_release(shared);
 
-            shutdown(port->fd, SHUT_RDWR);
+            shutdown_socket(port->fd);
 
             break;
         }
@@ -198,7 +214,12 @@ static void *aging_main(void *argument)
     {
         struct timespec deadline;
 
-        clock_gettime(CLOCK_REALTIME, &deadline);
+        if (clock_gettime(CLOCK_REALTIME, &deadline) < 0)
+        {
+            perror("clock_gettime");
+
+            break;
+        }
 
         deadline.tv_sec += 5;
 
@@ -235,7 +256,12 @@ static void *refill_main(void *argument)
     {
         struct timespec deadline;
 
-        clock_gettime(CLOCK_REALTIME, &deadline);
+        if (clock_gettime(CLOCK_REALTIME, &deadline) < 0)
+        {
+            perror("clock_gettime");
+
+            break;
+        }
 
         deadline.tv_nsec += 100000000;
 
@@ -259,6 +285,8 @@ static void *refill_main(void *argument)
 
         pthread_mutex_unlock(&sw->timer_lock);
 
+        pthread_rwlock_rdlock(&sw->ports_lock);
+
         for (int i = 0; i < sw->max_ports; i++)
         {
             if (sw->ports[i].active)
@@ -268,6 +296,8 @@ static void *refill_main(void *argument)
                 );
             }
         }
+
+        pthread_rwlock_unlock(&sw->ports_lock);
     }
 
     return NULL;
@@ -281,6 +311,9 @@ static int start_port(
 {
     switch_port_t *port = &sw->ports[id];
 
+    if (port->receiver_started)
+        pthread_join(port->receiver_thread, NULL);
+
     memset(port, 0, sizeof(*port));
 
     port->id = id;
@@ -289,7 +322,7 @@ static int start_port(
 
     port->sw = sw;
 
-    atomic_init(&port->receiver_done, 0);
+    atomic_init(&port->frames_dropped, 0);
 
     if (output_queue_init(
             &port->output,
@@ -311,8 +344,6 @@ static int start_port(
         return -1;
     }
 
-    port->sender_started = 1;
-
     if (pthread_create(
             &port->receiver_thread,
             NULL,
@@ -322,7 +353,7 @@ static int start_port(
     {
         output_queue_close(&port->output);
 
-        shutdown(fd, SHUT_RDWR);
+        shutdown_socket(fd);
 
         pthread_join(port->sender_thread, NULL);
 
@@ -338,50 +369,6 @@ static int start_port(
     printf("Host connected on switch port %d\n", id);
 
     return 0;
-}
-
-static void reap_disconnected(switch_state_t *sw)
-{
-    for (int i = 0; i < sw->max_ports; i++)
-    {
-        switch_port_t *port = &sw->ports[i];
-
-        if (port->active &&
-            atomic_load(&port->receiver_done))
-        {
-            if (port->receiver_started)
-            {
-                pthread_join(
-                    port->receiver_thread,
-                    NULL
-                );
-            }
-
-            output_queue_close(&port->output);
-
-            if (port->sender_started)
-            {
-                pthread_join(
-                    port->sender_thread,
-                    NULL
-                );
-            }
-
-            close(port->fd);
-
-            output_queue_destroy(&port->output);
-
-            pthread_mutex_lock(&sw->ports_lock);
-
-            port->active = 0;
-
-            pthread_mutex_unlock(&sw->ports_lock);
-
-            sem_post(&sw->free_ports);
-
-            printf("Port %d disconnected and released\n", i);
-        }
-    }
 }
 
 static int create_server(int port)
@@ -451,7 +438,7 @@ static int init_switch(
 
     atomic_init(&sw->stopping, 0);
 
-    if (pthread_mutex_init(
+    if (pthread_rwlock_init(
             &sw->ports_lock,
             NULL
         ) != 0)
@@ -464,7 +451,7 @@ static int init_switch(
             NULL
         ) != 0)
     {
-        pthread_mutex_destroy(&sw->ports_lock);
+        pthread_rwlock_destroy(&sw->ports_lock);
         return -1;
     }
 
@@ -474,7 +461,7 @@ static int init_switch(
         ) != 0)
     {
         pthread_mutex_destroy(&sw->timer_lock);
-        pthread_mutex_destroy(&sw->ports_lock);
+        pthread_rwlock_destroy(&sw->ports_lock);
         return -1;
     }
 
@@ -486,7 +473,7 @@ static int init_switch(
     {
         pthread_cond_destroy(&sw->timer_changed);
         pthread_mutex_destroy(&sw->timer_lock);
-        pthread_mutex_destroy(&sw->ports_lock);
+        pthread_rwlock_destroy(&sw->ports_lock);
         return -1;
     }
 
@@ -495,7 +482,7 @@ static int init_switch(
         sem_destroy(&sw->free_ports);
         pthread_cond_destroy(&sw->timer_changed);
         pthread_mutex_destroy(&sw->timer_lock);
-        pthread_mutex_destroy(&sw->ports_lock);
+        pthread_rwlock_destroy(&sw->ports_lock);
         return -1;
     }
 
@@ -514,7 +501,7 @@ static int init_switch(
         sem_destroy(&sw->free_ports);
         pthread_cond_destroy(&sw->timer_changed);
         pthread_mutex_destroy(&sw->timer_lock);
-        pthread_mutex_destroy(&sw->ports_lock);
+        pthread_rwlock_destroy(&sw->ports_lock);
         return -1;
     }
 
@@ -530,7 +517,7 @@ static int init_switch(
         sem_destroy(&sw->free_ports);
         pthread_cond_destroy(&sw->timer_changed);
         pthread_mutex_destroy(&sw->timer_lock);
-        pthread_mutex_destroy(&sw->ports_lock);
+        pthread_rwlock_destroy(&sw->ports_lock);
         return -1;
     }
 
@@ -551,7 +538,7 @@ static int init_switch(
         sem_destroy(&sw->free_ports);
         pthread_cond_destroy(&sw->timer_changed);
         pthread_mutex_destroy(&sw->timer_lock);
-        pthread_mutex_destroy(&sw->ports_lock);
+        pthread_rwlock_destroy(&sw->ports_lock);
         return -1;
     }
 
@@ -571,17 +558,21 @@ static void destroy_switch(switch_state_t *sw)
     if (sw->server_fd >= 0)
         close(sw->server_fd);
 
+    pthread_rwlock_wrlock(&sw->ports_lock);
+
     for (int i = 0; i < sw->max_ports; i++)
     {
         switch_port_t *port = &sw->ports[i];
 
         if (port->active)
         {
-            shutdown(port->fd, SHUT_RDWR);
+            shutdown_socket(port->fd);
 
             output_queue_close(&port->output);
         }
     }
+
+    pthread_rwlock_unlock(&sw->ports_lock);
 
     pthread_join(sw->aging_thread, NULL);
 
@@ -591,32 +582,8 @@ static void destroy_switch(switch_state_t *sw)
     {
         switch_port_t *port = &sw->ports[i];
 
-        if (port->active)
-        {
-            if (port->receiver_started)
-            {
-                pthread_join(
-                    port->receiver_thread,
-                    NULL
-                );
-            }
-
-            output_queue_close(&port->output);
-
-            if (port->sender_started)
-            {
-                pthread_join(
-                    port->sender_thread,
-                    NULL
-                );
-            }
-
-            close(port->fd);
-
-            output_queue_destroy(&port->output);
-
-            port->active = 0;
-        }
+        if (port->receiver_started)
+            pthread_join(port->receiver_thread, NULL);
     }
 
     printf("\nFinal MAC table:\n");
@@ -631,7 +598,7 @@ static void destroy_switch(switch_state_t *sw)
 
     pthread_mutex_destroy(&sw->timer_lock);
 
-    pthread_mutex_destroy(&sw->ports_lock);
+    pthread_rwlock_destroy(&sw->ports_lock);
 }
 
 int main(int argc, char *argv[])
@@ -672,9 +639,13 @@ int main(int argc, char *argv[])
 
     sigemptyset(&action.sa_mask);
 
-    sigaction(SIGINT, &action, NULL);
+    if (sigaction(SIGINT, &action, NULL) < 0 ||
+        signal(SIGPIPE, SIG_IGN) == SIG_ERR)
+    {
+        perror("signal");
 
-    signal(SIGPIPE, SIG_IGN);
+        return 1;
+    }
 
     switch_state_t sw;
 
@@ -697,8 +668,6 @@ int main(int argc, char *argv[])
 
     while (!stop_requested)
     {
-        reap_disconnected(&sw);
-
         struct pollfd pfd;
 
         pfd.fd = sw.server_fd;
@@ -722,7 +691,14 @@ int main(int argc, char *argv[])
         if (ready == 0)
             continue;
 
-        if (!(pfd.revents & POLLIN))
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+        {
+            fprintf(stderr, "Listening socket failed.\n");
+
+            break;
+        }
+
+        if (!(pfd.revents & POLLIN) || stop_requested)
             continue;
 
         struct sockaddr_in client;
@@ -747,32 +723,60 @@ int main(int argc, char *argv[])
 
         struct timespec timeout;
 
-        clock_gettime(CLOCK_REALTIME, &timeout);
+        if (clock_gettime(CLOCK_REALTIME, &timeout) < 0)
+        {
+            perror("clock_gettime");
+
+            close(client_fd);
+
+            break;
+        }
 
         timeout.tv_sec += 2;
 
-        if (sem_timedwait(
-                &sw.free_ports,
-                &timeout
-            ) < 0)
-        {
-            static const char full[] = "switch full\n";
+        int available;
 
-            send(
-                client_fd,
-                full,
-                sizeof(full) - 1,
-                MSG_NOSIGNAL
-            );
+        do
+        {
+            available = sem_timedwait(&sw.free_ports, &timeout);
+        }
+        while (available < 0 && errno == EINTR && !stop_requested);
+
+        if (available < 0)
+        {
+            if (errno == ETIMEDOUT && !stop_requested)
+            {
+                static const char full[] = "switch full\n";
+
+                if (socket_write_exact(
+                        client_fd,
+                        full,
+                        sizeof(full) - 1
+                    ) < 0 && errno != EPIPE && errno != ECONNRESET)
+                {
+                    perror("send");
+                }
+            }
+            else if (errno != EINTR && !stop_requested)
+            {
+                perror("sem_timedwait");
+            }
 
             close(client_fd);
 
             continue;
         }
 
+        if (stop_requested)
+        {
+            close(client_fd);
+
+            break;
+        }
+
         int assigned = -1;
 
-        pthread_mutex_lock(&sw.ports_lock);
+        pthread_rwlock_wrlock(&sw.ports_lock);
 
         for (int i = 0; i < sw.max_ports; i++)
         {
@@ -796,13 +800,14 @@ int main(int argc, char *argv[])
             }
         }
 
-        pthread_mutex_unlock(&sw.ports_lock);
+        pthread_rwlock_unlock(&sw.ports_lock);
 
         if (assigned < 0)
         {
             close(client_fd);
 
-            sem_post(&sw.free_ports);
+            if (sem_post(&sw.free_ports) < 0)
+                perror("sem_post");
         }
     }
 

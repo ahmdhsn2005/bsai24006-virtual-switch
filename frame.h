@@ -22,6 +22,7 @@ int deserialize_frame(const uint8_t *buffer, frame_t *frame);
 
 int frame_read(int fd, frame_t *frame);
 int frame_write(int fd, const frame_t *frame);
+int socket_write_exact(int fd, const void *buffer, size_t length);
 
 int parse_mac(const char *text, uint8_t mac[6]);
 void print_mac(const uint8_t mac[6]);

@@ -16,9 +16,9 @@ typedef struct mac_entry
 
     int port;
 
-    atomic_int_fast64_t last_seen;
+    time_t last_seen;
 
-    atomic_uint_fast64_t last_used;
+    uint64_t last_used;
 
     struct mac_entry *next;
 
@@ -59,6 +59,8 @@ int mac_table_lookup(
 );
 
 void mac_table_age(mac_table_t *table, unsigned int age_seconds);
+
+void mac_table_remove_port(mac_table_t *table, int port);
 
 void mac_table_print(mac_table_t *table);
 

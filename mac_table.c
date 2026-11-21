@@ -67,141 +67,155 @@ static size_t count_on_port(mac_table_t *table, int port)
     return count;
 }
 
-static void evict_lru(mac_table_t *table)
+static mac_entry_t *find_entry(
+    mac_bucket_t *bucket,
+    const uint8_t mac[6]
+)
 {
-    mac_entry_t *oldest = NULL;
-
-    int oldest_bucket = -1;
-
-    uint64_t oldest_value = UINT64_MAX;
-
-    for (int i = 0; i < MAC_BUCKETS; i++)
-    {
-        pthread_mutex_lock(&table->buckets[i].lock);
-
-        mac_entry_t *e = table->buckets[i].head;
-
-        while (e != NULL)
-        {
-            uint64_t used = atomic_load(&e->last_used);
-
-            if (used < oldest_value)
-            {
-                oldest_value = used;
-                oldest = e;
-                oldest_bucket = i;
-            }
-
-            e = e->next;
-        }
-
-        pthread_mutex_unlock(&table->buckets[i].lock);
-    }
-
-    if (oldest_bucket >= 0)
-    {
-        pthread_mutex_lock(&table->buckets[oldest_bucket].lock);
-
-        mac_entry_t **link = &table->buckets[oldest_bucket].head;
-
-        while (*link != NULL && *link != oldest)
-            link = &(*link)->next;
-
-        if (*link == oldest)
-        {
-            *link = oldest->next;
-
-            free(oldest);
-
-            table->size--;
-        }
-
-        pthread_mutex_unlock(&table->buckets[oldest_bucket].lock);
-    }
-}
-
-int mac_table_learn(mac_table_t *table, const uint8_t mac[6], int port)
-{
-    unsigned int index = hash_mac(mac);
-
-    pthread_mutex_lock(&table->change_lock);
-
-    pthread_mutex_lock(&table->buckets[index].lock);
-
-    mac_entry_t *e = table->buckets[index].head;
+    mac_entry_t *e = bucket->head;
 
     while (e != NULL)
     {
         if (memcmp(e->mac, mac, 6) == 0)
-        {
-            if (e->port != port)
-            {
-                printf("MAC moved: port %d -> port %d\n",
-                       e->port, port);
-            }
-
-            e->port = port;
-
-            atomic_store(&e->last_seen, (int64_t)time(NULL));
-
-            atomic_store(
-                &e->last_used,
-                atomic_fetch_add(&table->clock, 1)
-            );
-
-            pthread_mutex_unlock(&table->buckets[index].lock);
-
-            pthread_mutex_unlock(&table->change_lock);
-
-            return 0;
-        }
+            return e;
 
         e = e->next;
     }
 
-    pthread_mutex_unlock(&table->buckets[index].lock);
+    return NULL;
+}
 
-    if (count_on_port(table, port) >= MAC_MAX_PER_PORT)
+static void evict_lru(mac_table_t *table)
+{
+    mac_entry_t **oldest = NULL;
+
+    for (int i = 0; i < MAC_BUCKETS; i++)
+        pthread_mutex_lock(&table->buckets[i].lock);
+
+    for (int i = 0; i < MAC_BUCKETS; i++)
     {
+        mac_entry_t **link = &table->buckets[i].head;
+
+        while (*link != NULL)
+        {
+            if (oldest == NULL ||
+                (*link)->last_used < (*oldest)->last_used)
+            {
+                oldest = link;
+            }
+
+            link = &(*link)->next;
+        }
+    }
+
+    if (oldest != NULL)
+    {
+        mac_entry_t *entry = *oldest;
+
+        *oldest = entry->next;
+
+        free(entry);
+
+        table->size--;
+    }
+
+    for (int i = MAC_BUCKETS - 1; i >= 0; i--)
+        pthread_mutex_unlock(&table->buckets[i].lock);
+}
+
+int mac_table_learn(mac_table_t *table, const uint8_t mac[6], int port)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+        return -1;
+
+    mac_bucket_t *bucket = &table->buckets[hash_mac(mac)];
+
+    pthread_mutex_lock(&bucket->lock);
+
+    mac_entry_t *e = find_entry(bucket, mac);
+
+    if (e != NULL && e->port == port)
+    {
+        e->last_seen = now.tv_sec;
+
+        e->last_used = atomic_fetch_add(&table->clock, 1);
+
+        pthread_mutex_unlock(&bucket->lock);
+
+        return 0;
+    }
+
+    pthread_mutex_unlock(&bucket->lock);
+
+    pthread_mutex_lock(&table->change_lock);
+
+    size_t count = count_on_port(table, port);
+
+    pthread_mutex_lock(&bucket->lock);
+
+    e = find_entry(bucket, mac);
+
+    if (count >= MAC_MAX_PER_PORT &&
+        (e == NULL || e->port != port))
+    {
+        pthread_mutex_unlock(&bucket->lock);
+
         pthread_mutex_unlock(&table->change_lock);
 
         return -2;
     }
 
-    if (table->size >= MAC_TABLE_LIMIT)
-        evict_lru(table);
+    int previous_port = port;
 
-    mac_entry_t *entry = calloc(1, sizeof(*entry));
-
-    if (entry == NULL)
+    if (e == NULL)
     {
-        pthread_mutex_unlock(&table->change_lock);
+        e = malloc(sizeof(*e));
 
-        return -1;
+        if (e == NULL)
+        {
+            pthread_mutex_unlock(&bucket->lock);
+
+            pthread_mutex_unlock(&table->change_lock);
+
+            return -1;
+        }
+
+        if (table->size >= MAC_TABLE_LIMIT)
+        {
+            pthread_mutex_unlock(&bucket->lock);
+
+            evict_lru(table);
+
+            pthread_mutex_lock(&bucket->lock);
+        }
+
+        memcpy(e->mac, mac, 6);
+
+        e->next = bucket->head;
+
+        bucket->head = e;
+
+        table->size++;
+    }
+    else
+    {
+        previous_port = e->port;
     }
 
-    memcpy(entry->mac, mac, 6);
+    e->port = port;
 
-    entry->port = port;
+    e->last_seen = now.tv_sec;
 
-    atomic_init(&entry->last_seen, (int64_t)time(NULL));
+    e->last_used = atomic_fetch_add(&table->clock, 1);
 
-    atomic_init(
-        &entry->last_used,
-        atomic_fetch_add(&table->clock, 1)
-    );
-
-    pthread_mutex_lock(&table->buckets[index].lock);
-
-    entry->next = table->buckets[index].head;
-
-    table->buckets[index].head = entry;
-
-    table->size++;
-
-    pthread_mutex_unlock(&table->buckets[index].lock);
+    pthread_mutex_unlock(&bucket->lock);
 
     pthread_mutex_unlock(&table->change_lock);
+
+    if (previous_port != port)
+        printf("MAC moved: port %d -> port %d\n", previous_port, port);
 
     return 0;
 }
@@ -212,43 +226,38 @@ int mac_table_lookup(
     int *port
 )
 {
-    unsigned int index = hash_mac(mac);
+    mac_bucket_t *bucket = &table->buckets[hash_mac(mac)];
 
     int found = -1;
 
-    pthread_mutex_lock(&table->buckets[index].lock);
+    pthread_mutex_lock(&bucket->lock);
 
-    mac_entry_t *e = table->buckets[index].head;
+    mac_entry_t *e = find_entry(bucket, mac);
 
-    while (e != NULL)
+    if (e != NULL)
     {
-        if (memcmp(e->mac, mac, 6) == 0)
-        {
-            *port = e->port;
+        *port = e->port;
 
-            atomic_store(&e->last_seen, (int64_t)time(NULL));
+        e->last_used = atomic_fetch_add(&table->clock, 1);
 
-            atomic_store(
-                &e->last_used,
-                atomic_fetch_add(&table->clock, 1)
-            );
-
-            found = 0;
-
-            break;
-        }
-
-        e = e->next;
+        found = 0;
     }
 
-    pthread_mutex_unlock(&table->buckets[index].lock);
+    pthread_mutex_unlock(&bucket->lock);
 
     return found;
 }
 
 void mac_table_age(mac_table_t *table, unsigned int age_seconds)
 {
-    time_t now = time(NULL);
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+    {
+        perror("clock_gettime");
+
+        return;
+    }
 
     pthread_mutex_lock(&table->change_lock);
 
@@ -262,9 +271,7 @@ void mac_table_age(mac_table_t *table, unsigned int age_seconds)
         {
             mac_entry_t *e = *link;
 
-            time_t last_seen = (time_t)atomic_load(&e->last_seen);
-
-            if (now - last_seen >= (time_t)age_seconds)
+            if (now.tv_sec - e->last_seen >= (time_t)age_seconds)
             {
                 *link = e->next;
 
@@ -313,7 +320,7 @@ void mac_table_print(mac_table_t *table)
     }
 }
 
-void mac_table_clear(mac_table_t *table)
+void mac_table_remove_port(mac_table_t *table, int port)
 {
     pthread_mutex_lock(&table->change_lock);
 
@@ -321,25 +328,35 @@ void mac_table_clear(mac_table_t *table)
     {
         pthread_mutex_lock(&table->buckets[i].lock);
 
-        mac_entry_t *e = table->buckets[i].head;
+        mac_entry_t **link = &table->buckets[i].head;
 
-        while (e != NULL)
+        while (*link != NULL)
         {
-            mac_entry_t *next = e->next;
+            mac_entry_t *e = *link;
 
-            free(e);
+            if (port < 0 || e->port == port)
+            {
+                *link = e->next;
 
-            e = next;
+                free(e);
+
+                table->size--;
+            }
+            else
+            {
+                link = &e->next;
+            }
         }
-
-        table->buckets[i].head = NULL;
 
         pthread_mutex_unlock(&table->buckets[i].lock);
     }
 
-    table->size = 0;
-
     pthread_mutex_unlock(&table->change_lock);
+}
+
+void mac_table_clear(mac_table_t *table)
+{
+    mac_table_remove_port(table, -1);
 }
 
 void mac_table_destroy(mac_table_t *table)

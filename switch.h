@@ -30,10 +30,6 @@ typedef struct
 
     int receiver_started;
 
-    int sender_started;
-
-    atomic_int receiver_done;
-
     output_queue_t output;
 
     switch_state_t *sw;
@@ -42,7 +38,7 @@ typedef struct
 
     unsigned long frames_out;
 
-    unsigned long frames_dropped;
+    atomic_ulong frames_dropped;
 
 } switch_port_t;
 
@@ -54,7 +50,7 @@ struct switch_state
 
     switch_port_t ports[SWITCH_MAX_PORTS];
 
-    pthread_mutex_t ports_lock;
+    pthread_rwlock_t ports_lock;
 
     sem_t free_ports;
 

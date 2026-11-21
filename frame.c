@@ -32,7 +32,7 @@ static int read_exact(int fd, void *buffer, size_t length)
     return 1;
 }
 
-static int write_exact(int fd, const void *buffer, size_t length)
+int socket_write_exact(int fd, const void *buffer, size_t length)
 {
     size_t done = 0;
     const uint8_t *bytes = buffer;
@@ -51,7 +51,11 @@ static int write_exact(int fd, const void *buffer, size_t length)
         }
 
         if (n == 0)
+        {
+            errno = EPIPE;
+
             return -1;
+        }
 
         done += (size_t)n;
     }
@@ -137,12 +141,12 @@ int frame_write(int fd, const frame_t *frame)
 
     serialize_frame(frame, header);
 
-    if (write_exact(fd, header, sizeof(header)) < 0)
+    if (socket_write_exact(fd, header, sizeof(header)) < 0)
         return -1;
 
     if (frame->length > 0)
     {
-        if (write_exact(fd, frame->payload, frame->length) < 0)
+        if (socket_write_exact(fd, frame->payload, frame->length) < 0)
             return -1;
     }
 

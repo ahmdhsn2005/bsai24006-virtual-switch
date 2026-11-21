@@ -8,14 +8,16 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <signal.h>
+#include <errno.h>
+#include <poll.h>
 
 static int socket_fd;
 
 static uint8_t own_mac[6];
 
-static void *receive_main(void *unused)
+static void *receive_main(void *argument)
 {
-    (void)unused;
+    int done = *(int *)argument;
 
     frame_t frame;
 
@@ -39,7 +41,76 @@ static void *receive_main(void *unused)
         fflush(stdout);
     }
 
+    if (shutdown(socket_fd, SHUT_RDWR) < 0 && errno != ENOTCONN)
+        perror("shutdown");
+
+    ssize_t notified;
+
+    do
+    {
+        notified = write(done, "", 1);
+    }
+    while (notified < 0 && errno == EINTR);
+
+    if (notified < 0)
+        perror("write");
+
     return NULL;
+}
+
+static int send_line(char *line)
+{
+    char *destination = strtok(
+        line,
+        " \t\r\n"
+    );
+
+    if (destination == NULL)
+        return 0;
+
+    char *message = strtok(NULL, "\r\n");
+
+    if (message == NULL)
+        message = "";
+
+    frame_t frame;
+
+    memset(&frame, 0, sizeof(frame));
+
+    if (parse_mac(destination, frame.dst) < 0)
+    {
+        printf("Invalid destination MAC.\n");
+
+        return 0;
+    }
+
+    memcpy(frame.src, own_mac, 6);
+
+    frame.vlan = 1;
+
+    frame.priority = 1;
+
+    size_t length = strlen(message);
+
+    if (length > FRAME_MAX_PAYLOAD)
+    {
+        printf("Message too long.\n");
+
+        return 0;
+    }
+
+    frame.length = (uint16_t)length;
+
+    memcpy(frame.payload, message, length);
+
+    if (frame_write(socket_fd, &frame) < 0)
+    {
+        printf("Send failed.\n");
+
+        return -1;
+    }
+
+    return 0;
 }
 
 int main(int argc, char *argv[])
@@ -66,7 +137,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    signal(SIGPIPE, SIG_IGN);
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR)
+    {
+        perror("signal");
+
+        return 1;
+    }
 
     socket_fd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -117,89 +193,150 @@ int main(int argc, char *argv[])
 
     printf("Example: BB:BB:BB:BB:BB:02 Hello\n");
 
-    pthread_t receiver;
+    int done[2];
 
-    if (pthread_create(
-            &receiver,
-            NULL,
-            receive_main,
-            NULL
-        ) != 0)
+    if (pipe(done) < 0)
     {
-        fprintf(stderr, "Could not create receiver thread.\n");
+        perror("pipe");
 
         close(socket_fd);
 
         return 1;
     }
 
+    pthread_t receiver;
+
+    if (pthread_create(
+            &receiver,
+            NULL,
+            receive_main,
+            &done[1]
+        ) != 0)
+    {
+        fprintf(stderr, "Could not create receiver thread.\n");
+
+        close(done[0]);
+
+        close(done[1]);
+
+        close(socket_fd);
+
+        return 1;
+    }
+
+    struct pollfd input[2] = {
+        {STDIN_FILENO, POLLIN, 0},
+        {done[0], POLLIN, 0}
+    };
+
     char line[1600];
 
-    while (1)
+    size_t used = 0;
+
+    int too_long = 0;
+
+    int result = 0;
+
+    printf("> ");
+
+    fflush(stdout);
+
+    while (result == 0)
     {
-        printf("> ");
-
-        fflush(stdout);
-
-        if (fgets(line, sizeof(line), stdin) == NULL)
-            break;
-
-        char *destination = strtok(
-            line,
-            " \t\r\n"
-        );
-
-        if (destination == NULL)
-            continue;
-
-        char *message = strtok(NULL, "\r\n");
-
-        if (message == NULL)
-            message = "";
-
-        frame_t frame;
-
-        memset(&frame, 0, sizeof(frame));
-
-        if (parse_mac(destination, frame.dst) < 0)
+        if (poll(input, 2, -1) < 0)
         {
-            printf("Invalid destination MAC.\n");
+            if (errno == EINTR)
+                continue;
 
-            continue;
-        }
+            perror("poll");
 
-        memcpy(frame.src, own_mac, 6);
-
-        frame.vlan = 1;
-
-        frame.priority = 1;
-
-        size_t length = strlen(message);
-
-        if (length > FRAME_MAX_PAYLOAD)
-        {
-            printf("Message too long.\n");
-
-            continue;
-        }
-
-        frame.length = (uint16_t)length;
-
-        memcpy(frame.payload, message, length);
-
-        if (frame_write(socket_fd, &frame) < 0)
-        {
-            printf("Send failed.\n");
+            result = -1;
 
             break;
+        }
+
+        if (input[1].revents != 0)
+        {
+            printf("\nDisconnected from switch.\n");
+
+            break;
+        }
+
+        char buffer[sizeof(line)];
+
+        ssize_t n = read(STDIN_FILENO, buffer, sizeof(buffer));
+
+        if (n < 0)
+        {
+            if (errno == EINTR)
+                continue;
+
+            perror("read");
+
+            result = -1;
+
+            break;
+        }
+
+        if (n == 0)
+        {
+            if (too_long)
+                printf("Message too long.\n");
+            else if (used > 0)
+            {
+                line[used] = '\0';
+
+                result = send_line(line);
+            }
+
+            break;
+        }
+
+        for (ssize_t i = 0; i < n; i++)
+        {
+            if (buffer[i] == '\n')
+            {
+                if (too_long)
+                    printf("Message too long.\n");
+                else
+                {
+                    line[used] = '\0';
+
+                    result = send_line(line);
+
+                    if (result < 0)
+                        break;
+                }
+
+                used = 0;
+
+                too_long = 0;
+
+                printf("> ");
+
+                fflush(stdout);
+            }
+            else if (used < sizeof(line) - 1)
+            {
+                line[used++] = buffer[i];
+            }
+            else
+            {
+                too_long = 1;
+            }
         }
     }
 
-    shutdown(socket_fd, SHUT_RDWR);
-
-    close(socket_fd);
+    if (shutdown(socket_fd, SHUT_RDWR) < 0 && errno != ENOTCONN)
+        perror("shutdown");
 
     pthread_join(receiver, NULL);
 
-    return 0;
+    close(socket_fd);
+
+    close(done[0]);
+
+    close(done[1]);
+
+    return result < 0 ? 1 : 0;
 }
