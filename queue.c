@@ -1,6 +1,7 @@
 #include "queue.h"
 
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 
 static const int schedule[9] = {
@@ -58,7 +59,23 @@ int output_queue_init(output_queue_t *queue, double rate)
     if (pthread_mutex_init(&queue->lock, NULL) != 0)
         return -1;
 
-    if (pthread_cond_init(&queue->changed, NULL) != 0)
+    pthread_condattr_t attributes;
+
+    if (pthread_condattr_init(&attributes) != 0)
+    {
+        pthread_mutex_destroy(&queue->lock);
+
+        return -1;
+    }
+
+    int result = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+
+    if (result == 0)
+        result = pthread_cond_init(&queue->changed, &attributes);
+
+    pthread_condattr_destroy(&attributes);
+
+    if (result != 0)
     {
         pthread_mutex_destroy(&queue->lock);
 
@@ -96,7 +113,7 @@ int output_queue_push(output_queue_t *queue, shared_frame_t *frame)
 
     pthread_mutex_lock(&queue->lock);
 
-    if (queue->closed ||
+    if (queue->closed || queue->draining ||
         queue->count >= PORT_QUEUE_CAPACITY)
     {
         pthread_mutex_unlock(&queue->lock);
@@ -185,65 +202,9 @@ static int choose_priority(output_queue_t *queue)
     return -1;
 }
 
-shared_frame_t *output_queue_pop(output_queue_t *queue)
+static void refill_locked(output_queue_t *queue, struct timespec now)
 {
-    pthread_mutex_lock(&queue->lock);
-
-    while (!queue->closed &&
-           (queue->count == 0 || queue->tokens < 1.0))
-    {
-        pthread_cond_wait(&queue->changed, &queue->lock);
-    }
-
-    if (queue->closed)
-    {
-        pthread_mutex_unlock(&queue->lock);
-
-        return NULL;
-    }
-
-    int p = choose_priority(queue);
-
-    if (p < 0)
-    {
-        pthread_mutex_unlock(&queue->lock);
-
-        return NULL;
-    }
-
-    queue_node_t *node = queue->head[p];
-
-    queue->head[p] = node->next;
-
-    if (queue->head[p] == NULL)
-        queue->tail[p] = NULL;
-
-    queue->count--;
-
-    queue->tokens -= 1.0;
-
-    shared_frame_t *frame = node->item;
-
-    free(node);
-
-    pthread_mutex_unlock(&queue->lock);
-
-    return frame;
-}
-
-void output_queue_refill(output_queue_t *queue)
-{
-    struct timespec now;
-
-    if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
-        return;
-
-    pthread_mutex_lock(&queue->lock);
-
-    double elapsed = elapsed_seconds(
-        queue->last_refill,
-        now
-    );
+    double elapsed = elapsed_seconds(queue->last_refill, now);
 
     queue->tokens += elapsed * queue->rate_per_second;
 
@@ -251,24 +212,112 @@ void output_queue_refill(output_queue_t *queue)
         queue->tokens = queue->token_capacity;
 
     queue->last_refill = now;
-
-    pthread_cond_broadcast(&queue->changed);
-
-    pthread_mutex_unlock(&queue->lock);
 }
 
-void output_queue_close(output_queue_t *queue)
+shared_frame_t *output_queue_pop(
+    output_queue_t *queue,
+    unsigned long *generation
+)
 {
     pthread_mutex_lock(&queue->lock);
 
-    queue->closed = 1;
+    while (!queue->closed)
+    {
+        if (queue->count == 0)
+        {
+            if (queue->draining ||
+                pthread_cond_wait(&queue->changed, &queue->lock) != 0)
+            {
+                break;
+            }
 
-    pthread_cond_broadcast(&queue->changed);
+            continue;
+        }
+
+        struct timespec deadline;
+
+        if (clock_gettime(CLOCK_MONOTONIC, &deadline) < 0)
+            break;
+
+        refill_locked(queue, deadline);
+
+        if (queue->tokens >= 1.0)
+        {
+            int p = choose_priority(queue);
+
+            queue_node_t *node = queue->head[p];
+
+            queue->head[p] = node->next;
+
+            if (queue->head[p] == NULL)
+                queue->tail[p] = NULL;
+
+            queue->count--;
+
+            queue->tokens -= 1.0;
+
+            shared_frame_t *frame = node->item;
+
+            *generation = queue->generation;
+
+            free(node);
+
+            pthread_mutex_unlock(&queue->lock);
+
+            return frame;
+        }
+
+        deadline.tv_nsec += (long)((1.0 - queue->tokens) /
+                                   queue->rate_per_second * 1000000000.0) + 1;
+
+        deadline.tv_sec += deadline.tv_nsec / 1000000000;
+
+        deadline.tv_nsec %= 1000000000;
+
+        int result = pthread_cond_timedwait(
+            &queue->changed,
+            &queue->lock,
+            &deadline
+        );
+
+        if (result != 0 && result != ETIMEDOUT)
+            break;
+    }
+
+    pthread_mutex_unlock(&queue->lock);
+
+    return NULL;
+}
+
+int output_queue_current(output_queue_t *queue, unsigned long generation)
+{
+    pthread_mutex_lock(&queue->lock);
+
+    int current = !queue->closed && queue->generation == generation;
+
+    pthread_mutex_unlock(&queue->lock);
+
+    return current;
+}
+
+void output_queue_refill(output_queue_t *queue)
+{
+    pthread_mutex_lock(&queue->lock);
+
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+    {
+        refill_locked(queue, now);
+
+        if (queue->count > 0)
+            pthread_cond_signal(&queue->changed);
+    }
 
     pthread_mutex_unlock(&queue->lock);
 }
 
-void output_queue_destroy(output_queue_t *queue)
+static void discard_frames(output_queue_t *queue)
 {
     for (int p = 0; p < 3; p++)
     {
@@ -284,7 +333,77 @@ void output_queue_destroy(output_queue_t *queue)
 
             node = next;
         }
+
+        queue->head[p] = NULL;
+
+        queue->tail[p] = NULL;
     }
+
+    queue->count = 0;
+}
+
+size_t output_queue_configure(output_queue_t *queue, double rate, int discard)
+{
+    pthread_mutex_lock(&queue->lock);
+
+    size_t dropped = 0;
+
+    if (discard)
+    {
+        dropped = queue->count;
+
+        discard_frames(queue);
+
+        queue->generation++;
+    }
+
+    if (rate != queue->rate_per_second)
+    {
+        struct timespec now;
+
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+            refill_locked(queue, now);
+
+        queue->rate_per_second = rate;
+
+        queue->token_capacity = rate;
+
+        if (queue->tokens > rate)
+            queue->tokens = rate;
+    }
+
+    pthread_cond_signal(&queue->changed);
+
+    pthread_mutex_unlock(&queue->lock);
+
+    return dropped;
+}
+
+void output_queue_finish(output_queue_t *queue)
+{
+    pthread_mutex_lock(&queue->lock);
+
+    queue->draining = 1;
+
+    pthread_cond_signal(&queue->changed);
+
+    pthread_mutex_unlock(&queue->lock);
+}
+
+void output_queue_close(output_queue_t *queue)
+{
+    pthread_mutex_lock(&queue->lock);
+
+    queue->closed = 1;
+
+    pthread_cond_signal(&queue->changed);
+
+    pthread_mutex_unlock(&queue->lock);
+}
+
+void output_queue_destroy(output_queue_t *queue)
+{
+    discard_frames(queue);
 
     pthread_cond_destroy(&queue->changed);
 

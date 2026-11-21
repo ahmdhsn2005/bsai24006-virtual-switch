@@ -5,6 +5,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <time.h>
+#include <stdio.h>
 
 #define MAC_BUCKETS 32
 #define MAC_TABLE_LIMIT 1024
@@ -15,6 +16,8 @@ typedef struct mac_entry
     uint8_t mac[6];
 
     int port;
+
+    uint16_t vlan;
 
     time_t last_seen;
 
@@ -58,11 +61,26 @@ int mac_table_lookup(
     int *port
 );
 
+int mac_table_learn_vlan(
+    mac_table_t *table,
+    const uint8_t mac[6],
+    uint16_t vlan,
+    int port,
+    int *previous_port
+);
+
+int mac_table_lookup_vlan(
+    mac_table_t *table,
+    const uint8_t mac[6],
+    uint16_t vlan,
+    int *port
+);
+
 void mac_table_age(mac_table_t *table, unsigned int age_seconds);
 
 void mac_table_remove_port(mac_table_t *table, int port);
 
-void mac_table_print(mac_table_t *table);
+int mac_table_print(mac_table_t *table, FILE *output);
 
 void mac_table_clear(mac_table_t *table);
 

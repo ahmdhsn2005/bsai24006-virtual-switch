@@ -46,6 +46,10 @@ typedef struct
 
     int closed;
 
+    int draining;
+
+    unsigned long generation;
+
     unsigned int schedule_index;
 
     double tokens;
@@ -68,9 +72,18 @@ int output_queue_init(output_queue_t *queue, double rate);
 
 int output_queue_push(output_queue_t *queue, shared_frame_t *frame);
 
-shared_frame_t *output_queue_pop(output_queue_t *queue);
+shared_frame_t *output_queue_pop(
+    output_queue_t *queue,
+    unsigned long *generation
+);
+
+int output_queue_current(output_queue_t *queue, unsigned long generation);
 
 void output_queue_refill(output_queue_t *queue);
+
+size_t output_queue_configure(output_queue_t *queue, double rate, int discard);
+
+void output_queue_finish(output_queue_t *queue);
 
 void output_queue_close(output_queue_t *queue);
 
